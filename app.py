@@ -1,150 +1,118 @@
 import streamlit as st
 import pandas as pd
-import ast
-import matplotlib.pyplot as plt
-from matplotlib import cm
+import numpy as np
 from sklearn.neighbors import KNeighborsClassifier
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import Normalizer
-from sklearn.pipeline import make_pipeline
-from scipy.sparse import hstack
+from sklearn.model_selection import cross_validate, StratifiedKFold
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from scipy.sparse import load_npz, hstack
+import joblib
 
-# ---------- Custom Streamlit Page Config ----------
-st.set_page_config(page_title="AI Disease Predictor", page_icon="🧬", layout="wide")
-
-# ---------- Sidebar ----------
-with st.sidebar:
-    st.image("https://cdn-icons-png.flaticon.com/512/2718/2718224.png", width=100)
-    st.title("🩺 Smart Diagnosis")
-    st.markdown("""
-        This app uses **AI (KNN + TF-IDF)** to predict a disease category based on selected symptoms, signs, and risk factors.
-
-        👉 Select from dropdowns  
-        🎯 Click **Predict**  
-        📊 View confidence chart  
-    """)
-    st.info("Built with 💙 using Streamlit, scikit-learn, and Python")
-
-# ---------- Load and Process Data ----------
+# Load datasets and models
 @st.cache_data
 def load_data():
-    df_raw = pd.read_csv("disease_features.csv")
-    df = df_raw.copy()
-    for col in ['Risk Factors', 'Symptoms', 'Signs']:
-        df[col] = df[col].apply(lambda x: " ".join(ast.literal_eval(x)))
-    return df_raw, df
+    df = pd.read_csv("encoded_output2_with_categories.csv")
+    one_hot = df.drop(columns=["Disease", "Category"]).values
+    tfidf = load_npz("tfidf_combined_matrix.npz")
+    
+    label_encoder = LabelEncoder()
+    labels = label_encoder.fit_transform(df["Category"])
+    return df, one_hot, tfidf, labels, label_encoder
 
-df_raw, df = load_data()
+@st.cache_resource
+def load_vectorizers():
+    return {
+        "risk": joblib.load("vectorizer_risk.pkl"),
+        "symptoms": joblib.load("vectorizer_symptoms.pkl"),
+        "signs": joblib.load("vectorizer_signs.pkl"),
+        "subtypes": joblib.load("vectorizer_subtypes.pkl"),
+    }
 
-# ---------- Extract Keywords ----------
-import re
+df, one_hot_matrix, tfidf_matrix, labels, label_encoder = load_data()
+vectorizers = load_vectorizers()
 
-def extract_keywords(column):
-    phrases = set()
-    for item in df_raw[column]:
-        try:
-            parsed = ast.literal_eval(item)
-            if isinstance(parsed, list):
-                for term in parsed:
-                    cleaned = re.sub(r'\s+', ' ', str(term)).strip().lower()
-                    phrases.add(cleaned)
-        except Exception:
-            continue
-    return sorted(phrases)
+# UI - Header
+st.title("🧠 Disease Category Classifier (KNN)")
+st.markdown("This app uses **K-Nearest Neighbors** to classify diseases based on symptoms, risk factors, signs, and subtypes.")
 
-risk_options = extract_keywords("Risk Factors")
-symptom_options = extract_keywords("Symptoms")
-sign_options = extract_keywords("Signs")
+# Sidebar - Config
+st.sidebar.header("⚙️ Configuration")
+st.sidebar.markdown("Use the options below to configure the classifier.")
+encoding = st.sidebar.selectbox("Encoding Method", ["TF-IDF", "One-Hot"])
+k = st.sidebar.selectbox("Number of Neighbors (k)", [3, 5, 7])
+metric = st.sidebar.selectbox("Distance Metric", ["euclidean", "manhattan", "cosine"])
 
-# ---------- TF-IDF Vectorization ----------
-tfidf_risk = TfidfVectorizer()
-tfidf_symptoms = TfidfVectorizer()
-tfidf_signs = TfidfVectorizer()
+# Input area
+with st.expander("✏️ Input Details for Prediction", expanded=True):
+    st.markdown("Provide the details below to make a prediction.")
+    risk_input = st.text_input("Risk Factors", "fever stress")
+    symptoms_input = st.text_input("Symptoms", "chills cough")
+    signs_input = st.text_input("Signs", "wheezing sneezing")
+    subtypes_input = st.text_input("Subtypes", "viral")  # optional
 
-X_risk = tfidf_risk.fit_transform(df['Risk Factors'])
-X_symptoms = tfidf_symptoms.fit_transform(df['Symptoms'])
-X_signs = tfidf_signs.fit_transform(df['Signs'])
-X_tfidf = hstack([X_risk, X_symptoms, X_signs])
+# TF-IDF transformation function
+def transform_input_tfidf(risk, symptoms, signs, subtypes):
+    r = vectorizers["risk"].transform([risk])
+    s = vectorizers["symptoms"].transform([symptoms])
+    si = vectorizers["signs"].transform([signs])
+    su = vectorizers["subtypes"].transform([subtypes])
+    return hstack([r, s, si, su])
 
-# ---------- Target Labels ----------
-category_map = {
-    "Acute Coronary Syndrome": "Cardiovascular",
-    "Aortic Dissection": "Cardiovascular",
-    "Atrial Fibrillation": "Cardiovascular",
-    "Heart Failure": "Cardiovascular",
-    "Hypertensive Emergency": "Cardiovascular",
-    "Myocardial Infarction": "Cardiovascular",
-    "Asthma": "Respiratory",
-    "COPD": "Respiratory",
-    "Pneumonia": "Respiratory",
-    "Alzheimer": "Neurological",
-    "Migraine": "Neurological",
-    "Seizure": "Neurological",
-    "Stroke": "Neurological",
-    "Hypoglycemia": "Metabolic",
-    "Type I Diabetes": "Metabolic",
-    "Type II Diabetes": "Metabolic",
-    "Hyperthyroidism": "Endocrine",
-    "Hypothyroidism": "Endocrine",
-    "Adrenal Insufficiency": "Endocrine",
-    "Appendicitis": "Gastrointestinal",
-    "Gastritis": "Gastrointestinal",
-    "Peptic Ulcer": "Gastrointestinal"
-}
-df['Category'] = df['Disease'].map(category_map).fillna("Other")
-y = df['Category']
+# One-Hot Encoding function (dynamic from training set structure)
+def transform_input_one_hot(risk, symptoms, signs, subtypes):
+    all_columns = df.drop(columns=["Disease", "Category"]).columns
+    input_vector = np.zeros(len(all_columns))
 
-# ---------- Train Model ----------
-model = make_pipeline(Normalizer(), KNeighborsClassifier(n_neighbors=5, metric='euclidean'))
-model.fit(X_tfidf, y)
+    for i, col in enumerate(all_columns):
+        # check if the keyword (e.g., 'fever') is in user input
+        if (
+            any(word in col.lower() for word in risk.lower().split())
+            or any(word in col.lower() for word in symptoms.lower().split())
+            or any(word in col.lower() for word in signs.lower().split())
+            or any(word in col.lower() for word in subtypes.lower().split())
+        ):
+            input_vector[i] = 1
+    return input_vector
 
-# ---------- Main App UI ----------
-st.markdown("# 🤖 AI Disease Category Predictor")
-st.markdown("### Select your known symptoms, signs, and risk factors below to get a prediction.")
+# Predict & Evaluate
+if st.button("🔍 Predict & Evaluate"):
+    with st.spinner("Processing..."):
+        # Select matrix based on encoding choice
+        X = tfidf_matrix if encoding == "TF-IDF" else one_hot_matrix
 
-# Two column layout for inputs
-col1, col2, col3 = st.columns(3)
+        # Create input vector
+        if encoding == "TF-IDF":
+            input_vector = transform_input_tfidf(risk_input, symptoms_input, signs_input, subtypes_input)
+        elif encoding == "One-Hot":
+            input_vector = transform_input_one_hot(risk_input, symptoms_input, signs_input, subtypes_input)
+        else:
+            st.warning("Please select a valid encoding method.")
+            input_vector = None
 
-with col1:
-    selected_risks = st.multiselect("🧪 Risk Factors", options=risk_options)
+        # Train and predict
+        model = KNeighborsClassifier(n_neighbors=k, metric=metric)
+        model.fit(X, labels)
 
-with col2:
-    selected_symptoms = st.multiselect("🤒 Symptoms", options=symptom_options)
+        if input_vector is not None:
+            # Reshape if needed
+            if encoding == "TF-IDF":
+                prediction = model.predict(input_vector)[0]
+            else:
+                prediction = model.predict([input_vector])[0]
 
-with col3:
-    selected_signs = st.multiselect("🔍 Signs", options=sign_options)
+            predicted_label = label_encoder.inverse_transform([prediction])[0]
+            st.success(f"🧾 Predicted Category: {predicted_label}")
 
-st.markdown("---")
+        # Evaluate with 5-fold cross-validation
+        st.subheader("📊 Cross-Validation Metrics (5-Fold)")
+        scoring = ['accuracy', 'precision_macro', 'recall_macro', 'f1_macro']
+        results = cross_validate(model, X, labels, scoring=scoring, cv=StratifiedKFold(n_splits=5))
 
-# ---------- Prediction Logic ----------
-if st.button("🚀 Predict Disease Category"):
-    risk_input = " ".join(selected_risks)
-    symptom_input = " ".join(selected_symptoms)
-    sign_input = " ".join(selected_signs)
+        st.write(f"**Accuracy:** {np.mean(results['test_accuracy']):.3f}")
+        st.write(f"**Precision:** {np.mean(results['test_precision_macro']):.3f}")
+        st.write(f"**Recall:** {np.mean(results['test_recall_macro']):.3f}")
+        st.write(f"**F1 Score:** {np.mean(results['test_f1_macro']):.3f}")
 
-    risk_vec = tfidf_risk.transform([risk_input])
-    symptom_vec = tfidf_symptoms.transform([symptom_input])
-    sign_vec = tfidf_signs.transform([sign_input])
-    combined_vec = hstack([risk_vec, symptom_vec, sign_vec])
-
-    prediction = model.predict(combined_vec)[0]
-    proba = model.named_steps['kneighborsclassifier'].predict_proba(combined_vec)[0]
-    labels = model.named_steps['kneighborsclassifier'].classes_
-
-    confidence = round(proba[labels.tolist().index(prediction)] * 100, 2)
-
-    # Display result
-    st.success(f"🧠 Predicted Category: **{prediction}**")
-    st.info(f"📈 Confidence: **{confidence}%**")
-
-    # Pie chart
-    fig, ax = plt.subplots()
-    colors = cm.Paired(range(len(labels)))
-    ax.pie(proba, labels=labels, autopct='%1.1f%%', startangle=90, colors=colors)
-    ax.axis('equal')
-    st.markdown("### 🔬 Prediction Probabilities")
-    st.pyplot(fig)
-
-# Footer
-st.markdown("---")
-st.caption("Created by Muhammad Abdullah — Powered by Machine Learning & Streamlit")
+# Show dataset sample
+with st.expander("🧾 View Dataset Sample"):
+    st.dataframe(df.head())
